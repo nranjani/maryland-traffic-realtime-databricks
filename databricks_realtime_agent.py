@@ -3,7 +3,7 @@
 # MAGIC # Real-Time Traffic Risk Pipeline on Databricks
 # MAGIC ### Delta Lake + Structured Streaming + Mosaic AI Functions + Genie
 # MAGIC
-# MAGIC **Author:** Ranjani Narayanaswamy &nbsp;|&nbsp; **Course:** DSCI 5350 Big Data
+# MAGIC **Author:** Ranjani Narayanaswamy 
 # MAGIC
 # MAGIC This notebook builds an end-to-end real-time pipeline:
 # MAGIC
