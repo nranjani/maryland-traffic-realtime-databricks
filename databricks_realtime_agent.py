@@ -50,7 +50,7 @@ print(f"Upload new data1.csv to:  {RAW_CSV_PATH}")
 
 # COMMAND ----------
 
-# Step 1a: dump the CSV to Delta as raw strings (no in-Python conversion)
+# Just dump the CSV to Delta as raw strings - no conversion in PySpark
 df_raw = (
     spark.read
     .option("header", True)
@@ -68,8 +68,7 @@ display(spark.table(RAW_TABLE).limit(5))
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Step 1b: convert string timestamps + add derived columns in pure SQL
-# MAGIC -- (Pure SQL avoids Spark-Connect format-string quirks on serverless)
+# MAGIC -- Convert string timestamps and add derived columns using pure SQL
 # MAGIC CREATE OR REPLACE TABLE workspace.traffic_agent.incidents_raw AS
 # MAGIC SELECT
 # MAGIC     incident_id, n_tmc, direction, road_inc, road_tmc,
@@ -106,26 +105,29 @@ display(spark.table(RAW_TABLE).limit(5))
 # MAGIC   hour,
 # MAGIC   description,
 # MAGIC   weather AS weather_raw,
-# MAGIC
-# MAGIC   -- Classify each free-text description into one of 6 buckets
 # MAGIC   ai_classify(
 # MAGIC     description,
 # MAGIC     ARRAY('Collision','Disabled Vehicle','Roadwork','Debris','Weather Event','Other')
 # MAGIC   ) AS incident_category,
-# MAGIC
-# MAGIC   -- Pull structured fields out of the free text in one call
 # MAGIC   ai_extract(
 # MAGIC     description,
 # MAGIC     ARRAY('road','direction','severity','involves_emergency_vehicles')
 # MAGIC   ) AS extracted_fields
-# MAGIC
 # MAGIC FROM workspace.traffic_agent.incidents_raw
 # MAGIC WHERE description IS NOT NULL;
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Peek at the enrichment
+# MAGIC SELECT COUNT(*) AS total_rows FROM workspace.traffic_agent.incidents_enriched;
+# MAGIC
+# MAGIC SELECT incident_category, description
+# MAGIC FROM workspace.traffic_agent.incidents_enriched
+# MAGIC LIMIT 5;
+
+# COMMAND ----------
+
+# MAGIC %sql
 # MAGIC SELECT incident_category,
 # MAGIC        COUNT(*) AS n,
 # MAGIC        ROUND(AVG(duration_min), 1) AS avg_duration_min
@@ -174,19 +176,16 @@ if RUN_FALLBACK:
 # MAGIC CREATE OR REPLACE TABLE workspace.traffic_agent.road_priors AS
 # MAGIC SELECT
 # MAGIC   UPPER(road_inc) AS road,
-# MAGIC   COUNT(*)                                   AS incident_count,
-# MAGIC   ROUND(AVG(duration_min), 1)                AS avg_duration_min,
-# MAGIC   MODE(hour)                                 AS busiest_hour,
-# MAGIC   collect_set(incident_category)             AS observed_categories
+# MAGIC   COUNT(*) AS incident_count,
+# MAGIC   ROUND(AVG(duration_min), 1) AS avg_duration_min,
+# MAGIC   MODE(hour) AS busiest_hour,
+# MAGIC   collect_set(incident_category) AS observed_categories
 # MAGIC FROM workspace.traffic_agent.incidents_enriched
 # MAGIC WHERE road_inc IS NOT NULL
 # MAGIC GROUP BY UPPER(road_inc)
 # MAGIC HAVING COUNT(*) >= 5
 # MAGIC ORDER BY incident_count DESC;
-
-# COMMAND ----------
-
-# MAGIC %sql
+# MAGIC
 # MAGIC SELECT * FROM workspace.traffic_agent.road_priors LIMIT 10;
 
 # COMMAND ----------
@@ -257,6 +256,14 @@ print(f"Weather producer started. Landing dir: {LANDING_DIR}")
 
 # COMMAND ----------
 
+import os
+files = sorted(os.listdir(LANDING_DIR))
+print(f"{len(files)} weather files landed:")
+for f in files[-5:]:
+    print(" ", f)
+
+# COMMAND ----------
+
 # Structured Streaming reader - JSON -> Delta
 weather_schema = (
     "ts STRING, corridor STRING, lat DOUBLE, lon DOUBLE, "
@@ -276,8 +283,8 @@ query = (
     .format("delta")
     .outputMode("append")
     .option("checkpointLocation", checkpoint_path)
-    .trigger(processingTime="20 seconds")
-    .toTable(WEATHER_TABLE)
+    .trigger(availableNow=True)
+    .toTable("workspace.traffic_agent.weather_live")
 )
 
 print("Streaming query started. Stream ID:", query.id)
@@ -285,9 +292,15 @@ print("Let it run for ~2-3 minutes to accumulate a few batches, then move on.")
 
 # COMMAND ----------
 
-# Inspect what's landed so far
-spark.sql(f"SELECT COUNT(*) AS rows_so_far FROM {WEATHER_TABLE}").display()
-spark.sql(f"SELECT * FROM {WEATHER_TABLE} ORDER BY ts DESC LIMIT 10").display()
+# MAGIC %sql
+# MAGIC SELECT COUNT(*) AS rows_so_far FROM workspace.traffic_agent.weather_live;
+# MAGIC
+# MAGIC SELECT * FROM workspace.traffic_agent.weather_live ORDER BY ts DESC LIMIT 10;
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT COUNT(*) AS rows_so_far FROM workspace.traffic_agent.weather_live;
 
 # COMMAND ----------
 
@@ -306,7 +319,6 @@ spark.sql(f"SELECT * FROM {WEATHER_TABLE} ORDER BY ts DESC LIMIT 10").display()
 # MAGIC   FROM workspace.traffic_agent.weather_live
 # MAGIC ),
 # MAGIC matches AS (
-# MAGIC   -- Normalize both sides (strip hyphens/spaces/parens) so "MD-295" matches CSV's "MD295"
 # MAGIC   SELECT w.corridor, w.ts, w.temp_c, w.precip_mm, w.wind_kmh, w.weather_code,
 # MAGIC          p.road, p.incident_count, p.avg_duration_min,
 # MAGIC          ROW_NUMBER() OVER (
@@ -337,12 +349,16 @@ spark.sql(f"SELECT * FROM {WEATHER_TABLE} ORDER BY ts DESC LIMIT 10").display()
 # MAGIC   ) AS risk_score
 # MAGIC FROM matches
 # MAGIC WHERE match_rank = 1;
+# MAGIC
+# MAGIC SELECT corridor, road, risk_score, weather_code, temp_c, precip_mm, wind_kmh, incident_count
+# MAGIC FROM workspace.traffic_agent.corridor_risk_view
+# MAGIC ORDER BY risk_score DESC;
 
 # COMMAND ----------
 
 # MAGIC %sql
 # MAGIC SELECT corridor, risk_score, weather_code, temp_c, precip_mm, wind_kmh, incident_count
-# MAGIC FROM workspace.traffic_agent.corridor_risk_view
+# MAGIC FROM ${CATALOG}.${SCHEMA}.corridor_risk_view
 # MAGIC ORDER BY risk_score DESC;
 
 # COMMAND ----------
@@ -356,9 +372,9 @@ spark.sql(f"SELECT * FROM {WEATHER_TABLE} ORDER BY ts DESC LIMIT 10").display()
 # MAGIC %sql
 # MAGIC SELECT
 # MAGIC   corridor,
+# MAGIC   road,
 # MAGIC   risk_score,
-# MAGIC   ai_query(
-# MAGIC     'databricks-claude-3-7-sonnet',     -- or any serving endpoint you have access to
+# MAGIC   ai_gen(
 # MAGIC     CONCAT(
 # MAGIC       'You are a Maryland traffic operations analyst. In one sentence, ',
 # MAGIC       'explain the risk for ', corridor,
@@ -379,9 +395,18 @@ spark.sql(f"SELECT * FROM {WEATHER_TABLE} ORDER BY ts DESC LIMIT 10").display()
 
 # COMMAND ----------
 
-stop_event.set()
-for q in spark.streams.active:
-    print("stopping:", q.name or q.id)
+# Stop the producer thread if it's still in memory
+try:
+    stop_event.set()
+    print("Producer thread signaled to stop.")
+except NameError:
+    print("Producer variable lost (session reset) - that's fine, it'll time out on its own.")
+
+# Stop any active streaming queries
+active = spark.streams.active
+print(f"Found {len(active)} active streaming query(ies).")
+for q in active:
+    print(f"  stopping: {q.id}")
     q.stop()
 print("All streams stopped.")
 
@@ -404,9 +429,3 @@ print("All streams stopped.")
 # MAGIC
 # MAGIC **C. Take screenshots** of (1) this notebook's executed cells, (2) the Genie chat, (3) the AI/BI dashboard. Put them in your portfolio / GitHub README.
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Resume bullet (copy-paste)
-# MAGIC
-# MAGIC > **Real-Time Traffic Risk Pipeline (Databricks)** — Built an end-to-end Lakehouse pipeline on Databricks combining Delta Lake, Spark Structured Streaming, and Mosaic AI Functions (`ai_classify`, `ai_extract`, `ai_query`) to enrich 11K historical Maryland traffic incidents with LLM-generated categories and join them against a live Open-Meteo weather stream. Surfaced results through a Genie natural-language interface and an AI/BI dashboard with auto-refreshing risk scores per corridor. *Tech: Databricks, Unity Catalog, Delta Lake, PySpark, Structured Streaming, Mosaic AI, SQL.*
